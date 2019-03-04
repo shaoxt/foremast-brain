@@ -1,18 +1,20 @@
 import logging
 import json
 import time
-#import sys
-#sys.path.append('../')
+
 from scipy.stats import mannwhitneyu, wilcoxon,kruskal,friedmanchisquare
 
 from utils.timeutils import  canProcess, rateLimitCheck
 from elasticsearch.elasticsearchutils import updateDocStatus, searchByID , parseResult,RETRY_COUNT
 from metadata.metadata import REQUEST_STATE, METRIC_PERIOD, MIN_DATA_POINTS
 from prometheus.metric import convertPromesResponseToMetricInfos
+from wavefront.metric import convertResponseToMetricInfos
 from utils.urlutils import dorequest
 from metrics.metricclass import MetricInfo, SingleMetricInfo
 from utils.dictutils import retrieveKVList
 from helpers.modelhelpers import calculateModel,detectAnomalyData
+from wavefront.apis import executeQuery
+
 
 from mlalgms.pairwisemodel import TwoDataSetSameDistribution,MultipleDataSetSameDistribution
 
@@ -26,13 +28,20 @@ logger = logging.getLogger('foremastbrainhelper')
 
 
 
-def queryData(metricUrl, period, isProphet = False, datasource='PROMETHEUS'):
+def queryData(metricUrl, period, isProphet = False, datasource='prometheus'):
         djson = {}
-        
         for i in range(RETRY_COUNT):
             try:
-                respStr  = dorequest(metricUrl)
-                djson = json.loads(respStr)
+                if datasource == 'prometheus':
+                    respStr  = dorequest(metricUrl)
+                    djson = json.loads(respStr)
+                elif datasource == 'wavefront':
+                    datalist = metricUrl.split("&&")
+                    if len(datalist)<4:
+                        logger.error("missing wavefront query parameters : " +metricUrl)
+                        return []
+                    qresult  = executeQuery(datalist[0],datalist[1],datalist[2],datalist[3])
+                    return convertResponseToMetricInfos(qresult, period, isProphet ) 
                 break
             except Exception as e:
                 logger.error(e.__cause__)
@@ -48,7 +57,9 @@ def queryData(metricUrl, period, isProphet = False, datasource='PROMETHEUS'):
         else:
            djson= getBaselinejson()
         '''   
-        return convertPromesResponseToMetricInfos(djson, period, isProphet ) 
+        if datasource == 'prometheus':
+            return convertPromesResponseToMetricInfos(djson, period, isProphet ) 
+        return None
 
 def selectRequestToProcess(requests):
     if requests == None or len(requests) == 0:
@@ -147,27 +158,25 @@ def updateESDocStatus(url_update, url_search, uuid, status, info='', reason=''):
         updateDocStatus(url_update, uuid, status, info, reason)
         #leave this for test
         openRequest = retrieveRequestById(url_search, uuid)
-        if openRequest == None:
-            time.sleep(1)
-            logger.error("failed to find uuid "+uuid)
-            continue
-        new_status = openRequest['status']
-        if new_status == status:
-            return  True
-        else:
-            if i == 2 :
-               logger.error("failed to update uuid  "+uuid+" to "+status ) 
-            continue
+        if openRequest != None:
+            new_status = openRequest['status']
+            if new_status == status:
+                return  True
+        time.sleep(1)
+        logger.error("ElasticSearch failed "+uuid)
+        continue
     #one more last try
     for i in range(RETRY_COUNT):
         updateDocStatus(url_update, uuid, status)
         openRequest = retrieveRequestById(url_search, uuid)
-        if openRequest == None:
-            time.sleep(1)
-            continue
-        new_status = openRequest['status']
-        if new_status == status:
-            return  True
+        if openRequest != None:
+            new_status = openRequest['status']
+            if new_status == status:
+               return  True
+        time.sleep(1)
+        logger.error("ElasticSearch failed "+uuid)
+        continue
+
     return False
 
 def isCompletedStatus (status):
@@ -202,12 +211,15 @@ def filterEmptyDF(metricInfoList, min_data_points = 0):
     return newList, msg
 
 
-def computeHistoricalModel(historicalConfigMap, modelHolder, isProphet = False, datasource='PROMETHEUS' ):
+def computeHistoricalModel(historicalConfigMap, modelHolder, isProphet = False, historicalMetricStores=None ):
     dataSet = {}
     msg = ''
     min_data_points = modelHolder.getModelConfigByKey(MIN_DATA_POINTS)
     for metricType, metricUrl in historicalConfigMap.items(): 
-        metricInfolist = queryData(metricUrl, METRIC_PERIOD.HISTORICAL.value, isProphet);
+        metricStore = 'prometheus'
+        if historicalMetricStores is not None:
+           metricStore = historicalMetricStores[metricType]
+        metricInfolist = queryData(metricUrl, METRIC_PERIOD.HISTORICAL.value, isProphet, metricStore);
         if(len(metricInfolist)==0):
             continue
         filteredMetricInfoList, str =  filterEmptyDF(metricInfolist, min_data_points)
@@ -221,14 +233,25 @@ def computeHistoricalModel(historicalConfigMap, modelHolder, isProphet = False, 
     metricTypeCount = len(dataSet)
     if metricTypeCount == 0 :
         return modelHolder, msg
+
+    metricTypes, metricInfos = retrieveKVList(dataSet)
+    
+    for i in range (metricTypeCount):
+      modelHolder = calculateModel(metricInfos[i][0], modelHolder, metricTypes[i])
+
+
+    '''
+    ##TODO rollback
     if metricTypeCount == 1 :
         metricTypes, metricInfos = retrieveKVList(dataSet)
         #modelHolder  for historical metric there wil be only one
-        return calculateModel(metricInfos[0][0], modelHolder), msg
+        #TODO pzou
+        return calculateModel(metricInfos[0][0], modelHolder), msg    
     elif metricTypeCount == 2 :
         pass
     else:
         pass
+    '''
     return modelHolder,msg 
 
 
@@ -237,10 +260,13 @@ def computeHistoricalModel(historicalConfigMap, modelHolder, isProphet = False, 
     
     
 
-def computeNonHistoricalModel(configMap, period, datasource='PROMETHEUS'):
+def computeNonHistoricalModel(configMap, period, metricStores=None ):
     dataSet = {}
     for metricType, metricUrl in configMap.items(): 
-        metricInfolist = queryData(metricUrl, period);
+        metricStore = 'prometheus'
+        if metricStores is not None:
+           metricStore = metricStores[metricType]
+        metricInfolist = queryData(metricUrl, period, False, metricStore);
         if(len(metricInfolist)==0):
             continue
         filteredMetricInfoList =  filterEmptyDF(metricInfolist)
@@ -306,10 +332,10 @@ def computeAnomaly(metricInfoDataset, modelHolder):
     metricTypeSize = len(metricInfoDataset)
     anomalieDisplay =[]
     isFirstTime = True
-    if (metricTypeSize==1):
+    if (metricTypeSize>0):
         for metricType, metricInfoList in metricInfoDataset.items():
-             for metricInfo in metricInfoList:
-                 ts,adata =  detectAnomalyData(metricInfo,  modelHolder)
+             for metricInfo in metricInfoList:        
+                 ts,adata =  detectAnomalyData(metricInfo,  modelHolder, metricType)
                  if (len(ts) > 0):
                      if isFirstTime:
                          anomalieDisplay.append("{'")
@@ -320,9 +346,11 @@ def computeAnomaly(metricInfoDataset, modelHolder):
                          anomalieDisplay.append(",")
                      anomalieDisplay.append("{'metric':")
                      anomalieDisplay.append(str(metricInfo.columnmap['y']))
-                     anomalieDisplay.append(",'value':[")
+                     anomalieDisplay.append(",'value':{ 'ts' : ")
                      anomalieDisplay.append(str(ts))
-                     anomalieDisplay.append("]}")
+                     anomalieDisplay.append(", 'value'  : ")
+                     anomalieDisplay.append(str(adata))
+                     anomalieDisplay.append("}}")
         if (not isFirstTime):
             anomalieDisplay.append("]") 
             anomalieDisplay.append("}")                   
